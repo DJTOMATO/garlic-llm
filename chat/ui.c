@@ -175,6 +175,19 @@ static const char* strings[N_STRINGS][N_LANGS] = {
                    "Думал %d с · токенов: %d"},
     [S_THINK_CUT] = {"tope alcanzado", "limit reached", "limite atingido", "лимит"},
     [S_THINK_CHIP] = {"Pensar", "Think", "Pensar", "Думать"},
+    // The OpenAI-compatible API (L3). The toast that turns it on is followed by its address: "API on: http://..."
+    [S_API_ON] = {"API encendida", "API on", "API ligada", "API включён"},
+    [S_API_OFF] = {"API apagada", "API off", "API desligada", "API выключен"},
+    [S_API_FAILED] = {"La API no pudo iniciarse: revisa la red de la consola",
+                      "The API could not start: check the console's network",
+                      "A API não pôde iniciar: verifique a rede do console",
+                      "Не удалось запустить API: проверьте сеть консоли"},
+    [S_API_BUSY] = {"Respondiendo a una petición de la API…", "Answering an API request…",
+                    "Respondendo a uma requisição da API…", "Отвечаю на запрос API…"},
+    [S_API_DONE] = {"Respondí una petición de la API; empiezo una conversación nueva.",
+                    "I answered an API request; starting a new conversation.",
+                    "Respondi a uma requisição da API; começando uma nova conversa.",
+                    "Ответил на запрос API; начинаю новый разговор."},
 };
 
 const char* tr(StrId id) { return strings[id][ui_lang] ? strings[id][ui_lang] : strings[id][LANG_EN]; }
@@ -1508,6 +1521,8 @@ static void draw_header(const ChatView* v) {
         snprintf(t, sizeof(t), "%s · %d", tr(S_THINK_CHIP), v->think_cap);
         x = chip(x, cy, t, C_ACCENT_HI, C_ACCENT_HI, 1.0f, -1) - 14;
     }
+    if (v->api)   // the API is on: where it listens (the dot pulses while it answers a request)
+        x = chip(x, cy, v->api, 0xFFFFFF, v->api_busy ? C_ACCENT_HI : C_GREEN, v->api_busy ? pulse : 1.0f, -1) - 14;
     if (v->generating && v->tok_per_s > 0) {
         char s[48];
         snprintf(s, sizeof(s), "%.1f tok/s", v->tok_per_s);

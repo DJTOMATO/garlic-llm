@@ -26,7 +26,8 @@ typedef enum {
     S_HOLD_LONGER, S_PREPARING, S_LOADING_MODEL, S_LOADING_VOICE, S_ERROR_TITLE, S_ERROR_HINT, S_OFFLINE,
     S_SYSTEM_PROMPT, S_LOCAL_GPU, S_PY_RUN, S_PY_EXIT, S_PY_CLICK, S_PY_RCLICK, S_PY_MOVE, S_PY_KEYS, S_PY_BACK,
     S_PY_AGAIN, S_PY_FIX, S_PY_DONE, S_PY_ERROR, S_PY_STOPPED, S_PY_STARTING, S_PY_FIX_MSG, S_PY_FIX_ASK, S_PY_INPUT, S_VOICE_MODE, S_THINKING, S_LISTENING_SHORT, S_VOICE_LOADING, S_VOICE_NO_TTS,
-    S_THINK_OFF_HINT, S_THINK_ON_HINT, S_THINK_ON_TOAST, S_THINK_OFF_TOAST, S_THOUGHT, S_THINK_CUT, S_THINK_CHIP, N_STRINGS
+    S_THINK_OFF_HINT, S_THINK_ON_HINT, S_THINK_ON_TOAST, S_THINK_OFF_TOAST, S_THOUGHT, S_THINK_CUT, S_THINK_CHIP,
+    S_API_ON, S_API_OFF, S_API_FAILED, S_API_BUSY, S_API_DONE, N_STRINGS
 } StrId;
 const char* tr(StrId id);
 
@@ -72,6 +73,10 @@ typedef struct {
     double think_s;
     const char* think_text;
     size_t think_len;
+    // The OpenAI-compatible API (L3): while it is on the header shows api, e.g. "API · 192.168.1.5:8080" (NULL =
+    // off); api_busy while the model is answering one of its requests
+    const char* api;
+    int api_busy;
 } ChatView;
 
 void draw_chat(ChatView* v);

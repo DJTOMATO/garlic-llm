@@ -1,6 +1,7 @@
 // OpenAI-compatible HTTP API, server part on the console (see api.h). One thread accepts the connections and
 // reads their requests; the chat requests go to the main loop one at a time (api_run.inc), which owns the model.
 // The sockets are the console's sceNet calls, declared here as the OpenOrbis headers do not have them all.
+// Nothing here runs until api_enable(1): no network library, no socket, no thread.
 #include "api.h"
 
 #include <stdint.h>
@@ -25,6 +26,7 @@
 #define API_SO_RCVTIMEO 0x1006
 #define API_SO_SNDTIMEO 0x1005
 #define API_IPPROTO_TCP 6
+#define API_IPPROTO_UDP 17
 
 typedef struct {                // the BSD sockaddr_in: 16 bytes, the same size as OrbisNetSockaddr
     uint8_t len, family;
@@ -40,6 +42,11 @@ static int busy;                // a chat job is queued or running (api_done cle
 static char model_name[64] = "Garlic";
 static char* key;               // the API key, or NULL
 static OrbisPthread api_th;
+static int ready, have_thread;  // the network library, the mutex and the key are set up (once); the thread exists
+static volatile int on;         // the API is on: connections are served
+static OrbisNetId listen_fd = -1;   // the listening socket (changes under api_mu)
+static volatile int accepting;  // the server thread is waiting for a connection on it (in sceNetAccept)
+static char address[32];        // api_address()
 
 void api_set_model(const char* name) {
     snprintf(model_name, sizeof(model_name), "%s", name);
@@ -76,6 +83,7 @@ static void reply_json_error(int fd, int status, const char* reason, const char*
 }
 
 ApiJob* api_take(void) {
+    if (!ready) return NULL;   // (the API was never turned on)
     scePthreadMutexLock(&api_mu);
     ApiJob* j = queued;
     queued = NULL;
@@ -215,37 +223,57 @@ static void handle(int fd) {
     free(buf);
 }
 
+// The API is off: its port is closed, unless the server thread is waiting on the socket (then the thread closes it
+// when its wait ends). The socket is never closed under a thread that is using it.
+static void close_if_off(void) {
+    scePthreadMutexLock(&api_mu);
+    if (!on && !accepting && listen_fd >= 0) {
+        sceNetSocketClose(listen_fd);
+        listen_fd = -1;
+    }
+    scePthreadMutexUnlock(&api_mu);
+}
+
 static void* api_main(void* arg) {
     (void)arg;
     for (;;) {
-        ApiSockaddrIn peer;
-        OrbisNetSocklen_t plen = sizeof(peer);
-        int fd = sceNetAccept(*(OrbisNetId*)arg, (OrbisNetSockaddr*)&peer, &plen);
-        if (fd < 0) {
+        scePthreadMutexLock(&api_mu);
+        OrbisNetId l = on ? listen_fd : -1;
+        accepting = l >= 0;
+        scePthreadMutexUnlock(&api_mu);
+        if (l < 0) {   // the API is off: nothing to wait for
             sceKernelUsleep(100000);
             continue;
         }
-        handle(fd);
-        sceNetSocketClose(fd);
+        ApiSockaddrIn peer;
+        OrbisNetSocklen_t plen = sizeof(peer);
+        int fd = sceNetAccept(l, (OrbisNetSockaddr*)&peer, &plen);
+        accepting = 0;
+        if (fd >= 0) {
+            if (on) handle(fd);   // (a connection that came in after the API was turned off gets no answer)
+            sceNetSocketClose(fd);
+        }
+        close_if_off();
+        if (fd < 0) sceKernelUsleep(100000);   // (an error, or api_enable ended the wait to turn the API off)
     }
     return NULL;
 }
 
-static OrbisNetId listen_fd = -1;
-
-int api_start(void) {
-    scePthreadMutexInit(&api_mu, NULL, "garlic_api");
-    // the network library (as the SDK's net_http sample starts it), then the socket
+// The network library (as the SDK's net_http sample starts it), the mutex and the optional key: once, the first
+// time the API is turned on.
+static int api_setup(void) {
+    if (ready) return 0;
     int r = sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET);
     if (r < 0) {
-        say("api: network module 0x%08X; the API is off", r);
+        say("api: network module 0x%08X; the API stays off", r);
         return -1;
     }
     r = sceNetInit();
     if (r < 0) {
-        say("api: sceNetInit 0x%08X; the API is off", r);
+        say("api: sceNetInit 0x%08X; the API stays off", r);
         return -1;
     }
+    scePthreadMutexInit(&api_mu, NULL, "garlic_api");
     size_t n = 0;
     uint8_t* kd = read_all(API_KEY_FILE, &n);
     if (kd) {
@@ -259,31 +287,95 @@ int api_start(void) {
         }
         free(kd);
     }
-    listen_fd = sceNetSocket("garlic_api", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, API_IPPROTO_TCP);
-    if (listen_fd < 0) {
-        say("api: no socket (%d); the API is off", listen_fd);
+    ready = 1;
+    return 0;
+}
+
+// A socket listening on API_PORT, on any of the console's addresses; -1 if it cannot (logged).
+static OrbisNetId api_listen(void) {
+    OrbisNetId s = sceNetSocket("garlic_api", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, API_IPPROTO_TCP);
+    if (s < 0) {
+        say("api: no socket (%d); the API stays off", s);
         return -1;
     }
     int one = 1;
-    sceNetSetsockopt(listen_fd, API_SOL_SOCKET, API_SO_REUSEADDR, &one, sizeof(one));
+    sceNetSetsockopt(s, API_SOL_SOCKET, API_SO_REUSEADDR, &one, sizeof(one));
     ApiSockaddrIn a;
     memset(&a, 0, sizeof(a));
     a.len = sizeof(a);
     a.family = ORBIS_NET_AF_INET;
     a.port = sceNetHtons(API_PORT);
     a.addr = 0;   // any address
-    if (sceNetBind(listen_fd, (const OrbisNetSockaddr*)&a, sizeof(a)) || sceNetListen(listen_fd, 4)) {
-        say("api: cannot listen on port %d; the API is off", API_PORT);
-        sceNetSocketClose(listen_fd);
+    if (sceNetBind(s, (const OrbisNetSockaddr*)&a, sizeof(a)) || sceNetListen(s, 4)) {
+        say("api: cannot listen on port %d; the API stays off", API_PORT);
+        sceNetSocketClose(s);
         return -1;
     }
-    OrbisPthreadAttr attr;
-    scePthreadAttrInit(&attr);
-    scePthreadAttrSetstacksize(&attr, 256 << 10);
-    if (scePthreadCreate(&api_th, &attr, api_main, &listen_fd, "garlic_api")) {
-        say("api: no thread; the API is off");
-        return -1;
+    return s;
+}
+
+// The console's address on the network, for the screen: the one the system would send from to reach another
+// network. Connecting a UDP socket only makes the system choose that address; nothing is sent. Without a network
+// the address stays ":8080".
+static void find_address(void) {
+    snprintf(address, sizeof(address), ":%d", API_PORT);
+    OrbisNetId s = sceNetSocket("garlic_api_addr", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_DGRAM, API_IPPROTO_UDP);
+    if (s < 0) return;
+    static const uint8_t far[4] = {192, 0, 2, 1};   // (an address reserved for documentation: never a real host)
+    ApiSockaddrIn a;
+    memset(&a, 0, sizeof(a));
+    a.len = sizeof(a);
+    a.family = ORBIS_NET_AF_INET;
+    a.port = sceNetHtons(9);
+    memcpy(&a.addr, far, 4);
+    OrbisNetSocklen_t len = sizeof(a);
+    if (sceNetConnect(s, (const OrbisNetSockaddr*)&a, sizeof(a)) == 0 &&
+        sceNetGetsockname(s, (OrbisNetSockaddr*)&a, &len) == 0 && a.addr) {
+        const uint8_t* b = (const uint8_t*)&a.addr;   // (network byte order: the bytes as they are written)
+        snprintf(address, sizeof(address), "%u.%u.%u.%u:%d", b[0], b[1], b[2], b[3], API_PORT);
     }
-    say("api: OpenAI-compatible API on port %d%s", API_PORT, key ? " (API key required)" : "");
+    sceNetSocketClose(s);
+}
+
+int api_enabled(void) { return on; }
+
+const char* api_address(void) { return address; }
+
+int api_enable(int want) {
+    if (!want) {
+        if (!on) return 0;
+        scePthreadMutexLock(&api_mu);
+        OrbisNetId l = listen_fd;
+        on = 0;
+        scePthreadMutexUnlock(&api_mu);
+        // the server thread leaves its wait for a connection, and the port is closed (close_if_off)
+        if (l >= 0) sceNetSocketAbort(l, 0);
+        for (int i = 0; i < 40 && accepting; i++) sceKernelUsleep(5000);
+        close_if_off();
+        say("api: off");
+        return 0;
+    }
+    if (on) return 0;
+    if (api_setup()) return -1;
+    scePthreadMutexLock(&api_mu);
+    int l = listen_fd;   // (still open only if the server thread has been waiting on it since the API went off)
+    if (l < 0) l = listen_fd = api_listen();
+    if (l >= 0) on = 1;
+    scePthreadMutexUnlock(&api_mu);
+    if (l < 0) return -1;
+    if (!have_thread) {
+        OrbisPthreadAttr attr;
+        scePthreadAttrInit(&attr);
+        scePthreadAttrSetstacksize(&attr, 256 << 10);
+        if (scePthreadCreate(&api_th, &attr, api_main, NULL, "garlic_api")) {
+            say("api: no thread; the API stays off");
+            on = 0;
+            close_if_off();
+            return -1;
+        }
+        have_thread = 1;
+    }
+    find_address();
+    say("api: OpenAI-compatible API on %s%s", address, key ? " (API key required)" : "");
     return 0;
 }

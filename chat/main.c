@@ -4,7 +4,7 @@
 //
 // Chat: Cross = keyboard, hold Square = talk, Circle = stop the answer, Triangle = new conversation,
 // L2 / R2 = temperature, Up / Down = scroll, OPTIONS = system keyboard (e.g. a USB keyboard), R3 / touch pad =
-// think before answering on / off.
+// think before answering on / off, L3 = the OpenAI-compatible API on / off (api.h).
 // The model weights live in /data (see model.idx); GPU code, tokenizer and fonts are in the package's assets.
 
 #include <math.h>
@@ -306,6 +306,8 @@ static uint8_t pending[8];
 static int n_pending;
 static const char* toast_text;
 static int in_voice_mode;   // the voice mode screen is showing (its own thread draws it, see vs_main)
+static char api_chip[48];   // the API's label in the header while it is on ("" = off), see api_toggle
+static int api_busy;        // the model is answering an API request (api_run.inc)
 static void show_voice(int state);
 static void tts_new_reply(void);
 static void vs_publish(int think, int listen, float level);
@@ -359,6 +361,8 @@ static void view_update(void) {
     view.think_s = thinking ? view.time - think_t0 : 0;
     view.think_text = think_text;
     view.think_len = think_len;
+    view.api = api_chip[0] ? api_chip : NULL;
+    view.api_busy = api_busy;
     if (!generating) view.pos = pos + (hist_n - hist_done);   // (the answer still to read again counts)
 }
 
@@ -1783,6 +1787,98 @@ static void boot_report(void) {
 }
 
 
+// ---- the OpenAI-compatible API on the chat screen (api.c serves it, api_run.inc answers its requests) -------------
+// Off until L3 turns it on, and off again; API_FILE keeps the choice for the next start. While it is on the header
+// shows where it listens. While the model answers a request the conversation gives way to a note, the header shows
+// the speed and Circle stops the reply, as in the chat; with the stick pushed (scrolling) L3 does nothing.
+
+#define API_FILE "/data/garlic_api.txt"   // "1": the API is on when the app starts
+// L3 is a click of the stick that also scrolls: it counts only while the stick and the D-pad are at rest
+#define PAD_DIRS (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN | ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT)
+
+static void api_label(void) {
+    if (api_enabled()) snprintf(api_chip, sizeof(api_chip), "API · %s", api_address());
+    else api_chip[0] = 0;
+}
+
+static void api_config(void) {
+    size_t sz = 0;
+    char* f = (char*)read_all(API_FILE, &sz);
+    int on = f && sz && f[0] == '1';
+    free(f);
+    if (on) api_enable(1);
+    api_label();
+    say("API (L3): %s", api_enabled() ? api_address() : on ? "on in " API_FILE ", but it could not start" : "off");
+}
+
+static void api_toggle(void) {
+    static char text[160];
+    int on = !api_enabled();
+    int failed = api_enable(on) != 0;
+    api_label();
+    int f = open(API_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (f >= 0) write(f, api_enabled() ? "1" : "0", 1), close(f);
+    if (failed) snprintf(text, sizeof(text), "%s", tr(S_API_FAILED));
+    else if (!on) snprintf(text, sizeof(text), "%s", tr(S_API_OFF));
+    else if (api_address()[0] == ':') snprintf(text, sizeof(text), "%s", tr(S_API_ON));   // (no address to show)
+    else snprintf(text, sizeof(text), "%s: http://%s", tr(S_API_ON), api_address());
+    toast_text = text;
+    toast_until = now() + 3.0;
+    say("toast: %s", text);
+}
+
+// The chat's side of a request (api_run.inc): the conversation gives way to a note, and one frame shows it before
+// the prompt is read (as start_turn does for a question of the chat).
+static int api_had_chat, api_step_n;
+static double api_step_t;
+
+static void api_chat_begin(void) {
+    api_had_chat = n_msgs > 0;
+    msgs_clear();
+    Msg* note = msg_new(MSG_NOTE);
+    msg_append(note, tr(S_API_BUSY), strlen(tr(S_API_BUSY)));
+    api_busy = 1;
+    show_chat();
+}
+
+// The prompt is read and the reply begins: the chat screen's own thread draws meanwhile, as for a reply of the chat.
+static void api_chat_reply(void) {
+    generating = 1;
+    view.tok_per_s = 0;
+    api_step_n = 0, api_step_t = now();
+    ts_start();
+}
+
+// Before each step of the reply, with the tokens written so far: the speed for the header, and 1 if Circle is down.
+static int api_chat_step(int produced) {
+    double t = now(), dt = t - api_step_t;
+    int k = produced - api_step_n;
+    if (k > 0 && dt > 0) view.tok_per_s = view.tok_per_s ? view.tok_per_s * 0.9 + 0.1 * k / dt : k / dt;
+    api_step_n = produced, api_step_t = t;
+    show_chat();
+    return (read_buttons() & ORBIS_PAD_BUTTON_CIRCLE) != 0;
+}
+
+// The request is answered (or failed): a new conversation. If the request took one off the screen, a note says so.
+static void api_chat_end(void) {
+    ts_stop();
+    generating = 0;
+    api_busy = 0;
+    msgs_clear();
+    if (api_had_chat) {
+        Msg* note = msg_new(MSG_NOTE);
+        msg_append(note, tr(S_API_DONE), strlen(tr(S_API_DONE)));
+    }
+#ifdef GARLIC_SPEC
+    if (spec_active(&eng)) {   // (the MTP head's figures of this reply, as finish_turn logs them for the chat)
+        char sl[300];
+        spec_stats(&eng, sl, sizeof(sl));
+        say("%s", sl);
+        spec_stats_reset();
+    }
+#endif
+}
+
 #include "api_run.inc"   // the OpenAI-compatible API's jobs on the model (api.c serves the requests)
 
 int main(void) {
@@ -1847,7 +1943,7 @@ int main(void) {
     view.temperature = 0.7f;
     think_config();
     api_set_model(MODEL_NAME);
-    api_start();   // OpenAI-compatible API on port 8080 (api.h); its jobs run in the loop below
+    api_config();   // the OpenAI-compatible API (api.h), if it was left on; its jobs run in the loop below
 
     uint32_t prev = 0;
     int scroll_held = 0;
@@ -1856,6 +1952,7 @@ int main(void) {
         if (api_job_now) {   // an API request: the model answers it now, the chat waits
             api_job(api_job_now);
             api_done(api_job_now);
+            prev = read_buttons();   // (a button still held from the wait is not a new press)
         }
         uint32_t buttons = read_buttons();
         uint32_t pressed = buttons & ~prev;
@@ -1887,6 +1984,7 @@ int main(void) {
             view.scroll = 0;
         }
         else if (pressed & (ORBIS_PAD_BUTTON_R3 | ORBIS_PAD_BUTTON_TOUCH_PAD)) think_toggle();
+        else if ((pressed & ORBIS_PAD_BUTTON_L3) && !(buttons & PAD_DIRS)) api_toggle();   // (not while scrolling)
         if (!generating && !(buttons & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN))) hist_ahead(8);
         if (!generating && inj_ask_ready) {   // (test aid: "ask" in /data/garlic_keys.txt)
             say("user wrote %d bytes (test file)", (int)strlen(inj_ask));

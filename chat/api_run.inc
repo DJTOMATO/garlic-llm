@@ -1,6 +1,9 @@
 // OpenAI-compatible API jobs (api.c queues them; included in main.c, so it sees the engine and the conversation).
 // A job runs on the model between the chat's turns: the request's messages are the whole conversation, so the
 // conversation on screen is cleared, and the reply is written to the connection (whole, or as server-sent events).
+// The reply is generated as the chat generates its own: several tokens per step with the MTP head where the app has
+// it (GARLIC_SPEC), and Circle on the controller stops it. What the screen shows meanwhile is main.c's part
+// (api_chat_begin / _reply / _step / _end).
 
 static uint32_t api_ids[16384];   // the prompt of a job (byte-level tokens: at most one per byte of text)
 #define API_MAX_TEXT 15000        // bytes of message text a request may carry (the prompt must fit api_ids)
@@ -92,15 +95,6 @@ static void api_job(ApiJob* job) {
                   "invalid_body");
         return;
     }
-    // the model answers this request: the conversation on screen starts again from nothing
-    msgs_clear();
-    pos = 0;
-    need_close = 0;
-    hist_n = hist_done = 0;
-    thinking = think_turn = 0;
-    sys_pre = 0;
-    view.scroll = 0;
-
     int n = api_prompt(pool, &cr);
     if (n < 0) {
         free(pool);
@@ -114,6 +108,15 @@ static void api_job(ApiJob* job) {
                   "invalid_request_error", "context_length_exceeded");
         return;
     }
+    // the model answers this request: the conversation on screen starts again from nothing (a request refused
+    // above leaves it as it was)
+    pos = 0;
+    need_close = 0;
+    hist_n = hist_done = 0;
+    thinking = think_turn = 0;
+    sys_pre = 0;
+    view.scroll = 0;
+    api_chat_begin();   // (clears the conversation: a note says that a request is being answered)
     if (cr.has_seed) seed = cr.seed;
     char id[32];
     snprintf(id, sizeof(id), "chatcmpl-%u", ++api_count);
@@ -125,6 +128,7 @@ static void api_job(ApiJob* job) {
     if (engine_run(&eng, api_ids, n, 0, (float)cr.temperature, seed++, &next_token)) {
         api_error(job->fd, "HTTP/1.1 500 Internal Server Error", eng.error, "server_error", NULL);
         pos = 0;
+        api_chat_end();
         return;
     }
     pos = n;
@@ -145,10 +149,17 @@ static void api_job(ApiJob* job) {
     Sb text, pend;   // the reply (all of it), and the bytes of the last tokens not yet a whole character
     sb_init(&text);
     sb_init(&pend);
-    int produced = 0;
+    int produced = 0, stopped = 0;
     const char* finish = "length";
-    uint32_t t = next_token;
+    // The tokens to write: the one a step drew, after those it kept from the MTP head's draft (the model has read
+    // these already). Without the head a step is one token.
+    uint32_t q[9];
+    int nq = 1, iq = 0;
+    q[0] = next_token;
+    double t0 = now();
+    api_chat_reply();
     while (produced < cr.max_tokens) {
+        uint32_t t = q[iq++];
         if (t == IM_END || t == eng.eos2 || t == eng.eos) {
             finish = "stop";
             break;
@@ -174,14 +185,32 @@ static void api_job(ApiJob* job) {
             }
         }
         if (client_gone || produced == cr.max_tokens) break;
+        if (iq < nq) continue;   // (the next token is one the last step kept)
+        if (api_chat_step(produced)) {   // Circle: the reply ends here, cut short as by max_tokens
+            stopped = 1;
+            break;
+        }
+        int ne = 0;   // tokens of the draft this step keeps
+#ifdef GARLIC_SPEC
+        if (spec_active(&eng)) {   // (never more than max_tokens: the step keeps at most what is left of them)
+            if (engine_spec_step(&eng, t, pos, (float)cr.temperature, seed++, cr.max_tokens - produced + 1, q, &ne,
+                                 &next_token)) {
+                error = 1;
+                break;
+            }
+        } else
+#endif
         if (engine_run(&eng, &t, 1, pos, (float)cr.temperature, seed++, &next_token)) {
             error = 1;
             break;
         }
-        pos++;
-        t = next_token;
+        pos += 1 + ne;
+        q[ne] = next_token;
+        nq = ne + 1, iq = 0;
     }
-    say("api: %d tokens, %s", produced, error ? "engine error" : finish);
+    double dt = now() - t0;
+    say("api: %d tokens in %.1f s (%.1f tokens/s), %s", produced, dt, dt > 0 ? produced / dt : 0.0,
+        error ? "engine error" : stopped ? "stopped on the console" : finish);
 
     if (streamed) {
         if (!client_gone && !error) {
@@ -218,4 +247,5 @@ static void api_job(ApiJob* job) {
     // the engine's state is this request's; the conversation on screen starts again at position 0
     pos = 0;
     need_close = 0;
+    api_chat_end();
 }

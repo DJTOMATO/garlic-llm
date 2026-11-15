@@ -1,5 +1,6 @@
 // Host test for chat/api_run.inc (the API's model side), with a mock engine and tokenizer, so the job logic runs
-// without the PS4. The real file is included as main.c includes it.
+// without the PS4. The real file is included as main.c includes it. Every test runs twice: one token per step
+// (engine_run), and several per step as with the MTP head (engine_spec_step).
 // Build and run: gcc -std=gnu99 -Wall -Wextra -g -fsanitize=address,undefined -I chat tests/api_run_test.c chat/api_proto.c -o build/api_run_test && build/api_run_test
 #include <stdarg.h>
 #include <stdint.h>
@@ -35,7 +36,14 @@ typedef struct {
     int scroll;
 } ChatView;
 static ChatView view;
-static int fail_engine_at = -1;   // engine_run fails on this call (-1: never)
+static int fail_engine_at = -1;   // the engine fails on this call (-1: never)
+#define GARLIC_SPEC 1             // (as the 9B app: api_run.inc asks spec_active before every step)
+static int spec_on;               // the mock MTP head is on: a step keeps up to spec_keep tokens of its draft
+static int spec_keep = 2;
+static int next_pos, pos_errors;  // where the next token must go; steps given another position
+static int fed;                   // tokens of the reply fed to the model
+// what main.c shows of a job: begun and ended (they must pair), and Circle held from stop_at tokens on (-1: never)
+static int chat_begun, chat_ended, chat_replies, stop_at = -1;
 
 // Scripted reply: the model emits script[k], then IM_END. Tokens 500/501 are the two halves of "é".
 static const uint32_t* script;
@@ -60,7 +68,11 @@ const char* api_model(void) { return "Qwen3.5-9B"; }
 static void say(const char* fmt, ...) {
     (void)fmt;
 }
-static void msgs_clear(void) { msgs_cleared++; }
+static double now(void) { return 0; }
+static void api_chat_begin(void) { chat_begun++, msgs_cleared++; }   // (the real one clears the conversation)
+static void api_chat_reply(void) { chat_replies++; }
+static int api_chat_step(int produced) { return stop_at >= 0 && produced >= stop_at; }
+static void api_chat_end(void) { chat_ended++; }
 static int tok_encode(const Tokenizer* t, const char* s, uint32_t* out, int max);
 // as main.c
 static int encode_into(uint32_t* ids, int n, int max, const char* text) { return n + tok_encode(&tok, text, ids + n, max - n); }
@@ -98,16 +110,44 @@ static int engine_run(MockEngine* e, const uint32_t* tokens, int n, int pos0, fl
                       uint32_t* next) {
     (void)temperature;
     (void)sd;
-    (void)pos0;
     engine_calls++;
     if (engine_calls == fail_engine_at) {
         snprintf(e->error, sizeof(e->error), "mock GPU fault");
         return -1;
     }
-    if (n > 1) prompt_len_seen = n;   // the prompt (fed in one go)
+    if (n > 1) prompt_len_seen = n, next_pos = 0;   // the prompt (fed in one go, from position 0)
+    else fed++;
+    if (pos0 != next_pos) pos_errors++;
+    next_pos += n;
     if (script_k < script_len) *next = script[script_k++];
     else *next = IM_END;
     (void)tokens;
+    return 0;
+}
+
+// as engine_spec.inc: tok goes in at pos0, up to max_new - 1 tokens of the draft are kept, and the next one is drawn
+static int spec_active(const MockEngine* e) {
+    (void)e;
+    return spec_on;
+}
+static int engine_spec_step(MockEngine* e, uint32_t tk, int pos0, float temperature, unsigned sd, int max_new,
+                            uint32_t* out, int* n_out, uint32_t* next) {
+    (void)tk;
+    (void)temperature;
+    (void)sd;
+    engine_calls++;
+    if (engine_calls == fail_engine_at) {
+        snprintf(e->error, sizeof(e->error), "mock GPU fault");
+        return -1;
+    }
+    int k = 0;
+    while (k < spec_keep && k < max_new - 1 && script_k < script_len) out[k++] = script[script_k++];
+    *n_out = k;
+    if (pos0 != next_pos) pos_errors++;
+    next_pos += 1 + k;
+    fed += 1 + k;
+    if (script_k < script_len) *next = script[script_k++];
+    else *next = IM_END;
     return 0;
 }
 
@@ -131,6 +171,7 @@ static void run_job(const char* body, const uint32_t* sc, int sc_len) {
     script_len = sc_len;
     script_k = 0;
     engine_calls = 0;
+    fed = 0;
     ApiJob job;
     memset(&job, 0, sizeof(job));
     job.body = (char*)body;
@@ -183,6 +224,7 @@ static void test_stream(void) {
 }
 
 static void test_errors(void) {
+    int cleared = msgs_cleared, begun = chat_begun;
     run_job("{\"messages\":[]}", NULL, 0);
     CHECK(strncmp(wire, "HTTP/1.1 400 Bad Request", 23) == 0);
     CHECK(strstr(wire, "\"type\":\"invalid_request_error\"") != NULL);
@@ -192,6 +234,7 @@ static void test_errors(void) {
     CHECK(strncmp(wire, "HTTP/1.1 400 Bad Request", 23) == 0);
     CHECK(strstr(wire, "context_length_exceeded") != NULL);
     eng.ctx_limit = 4096;
+    CHECK(msgs_cleared == cleared && chat_begun == begun);   // a refused request leaves the conversation on screen
 
     static const uint32_t sc[] = {'A' + 1};
     fail_engine_at = 1;
@@ -234,6 +277,52 @@ static void test_client_gone(void) {
     CHECK(pos == 0);
 }
 
+// Several tokens per step: the reply is the same, in fewer steps, and never past max_tokens.
+static void test_spec(void) {
+    if (!spec_on) return;
+    static const uint32_t sc[] = {'H' + 1, 'o' + 1, 'l' + 1, 'a' + 1, ' ' + 1, 'P' + 1, 'S' + 1, '4' + 1};
+    run_job("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":64}", sc, 8);
+    CHECK(strstr(wire, "\"content\":\"Hola PS4\"") != NULL);
+    CHECK(strstr(wire, "\"finish_reason\":\"stop\"") != NULL);
+    CHECK(strstr(wire, "\"completion_tokens\":8") != NULL);
+    CHECK(engine_calls == 1 + 3);   // the prompt, then H + ol, a + " P", S + 4 (8 steps one token at a time)
+    CHECK(fed == 8);
+
+    spec_keep = 8;   // the draft would keep more than max_tokens allows
+    run_job("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4}", sc, 8);
+    spec_keep = 2;
+    CHECK(strstr(wire, "\"content\":\"Hola\"") != NULL);
+    CHECK(strstr(wire, "\"finish_reason\":\"length\"") != NULL);
+    CHECK(strstr(wire, "\"completion_tokens\":4") != NULL);
+    CHECK(fed == 4);   // the model read what was written, nothing more
+
+    // a draft never holds the end of the turn; if one did, the reply would end there all the same
+    static const uint32_t end_in_draft[] = {'A' + 1, 'B' + 1, IM_END, 'C' + 1};
+    run_job("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", end_in_draft, 4);
+    CHECK(strstr(wire, "\"content\":\"AB\"") != NULL);
+    CHECK(strstr(wire, "\"finish_reason\":\"stop\"") != NULL);
+    CHECK(strstr(wire, "\"completion_tokens\":2") != NULL);
+}
+
+// Circle on the controller: the reply ends there, cut short as by max_tokens, and the client gets what was written.
+static void test_stop(void) {
+    static const uint32_t sc[] = {'A' + 1, 'B' + 1, 'C' + 1, 'D' + 1, 'E' + 1, 'F' + 1};
+    stop_at = 2;
+    run_job("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", sc, 6);
+    // one token per step stops at "AB"; with the MTP head the first step had already given "BCD" (B, C kept; D drawn)
+    CHECK(strstr(wire, spec_on ? "\"content\":\"ABCD\"" : "\"content\":\"AB\"") != NULL);
+    CHECK(strstr(wire, "\"finish_reason\":\"length\"") != NULL);
+    CHECK(strstr(wire, "HTTP/1.1 200 OK") != NULL);
+
+    run_job("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true}", sc, 6);
+    stop_at = -1;
+    CHECK(strstr(wire, "\"content\":\"A\"") != NULL);
+    CHECK(strstr(wire, "\"content\":\"F\"") == NULL);
+    CHECK(strstr(wire, "\"finish_reason\":\"length\"") != NULL);
+    CHECK(strstr(wire, "data: [DONE]\n\n") != NULL);   // the stream closes as usual
+    CHECK(pos == 0);
+}
+
 static void test_utf8(void) {
     CHECK(api_utf8_whole((const uint8_t*)"\xc3", 1) == 0);
     CHECK(api_utf8_whole((const uint8_t*)"a\xc3", 2) == 1);
@@ -244,12 +333,19 @@ static void test_utf8(void) {
 
 int main(void) {
     test_utf8();
-    test_completion();
-    test_length();
-    test_stream();
-    test_errors();
-    test_stream_error();
-    test_client_gone();
+    for (spec_on = 0; spec_on <= 1; spec_on++) {
+        test_completion();
+        test_length();
+        test_stream();
+        test_errors();
+        test_stream_error();
+        test_client_gone();
+        test_spec();
+        test_stop();
+        CHECK(pos_errors == 0);            // every token went in at the position after the one before
+        CHECK(chat_begun == chat_ended);   // every request that took the screen gave it back
+        CHECK(chat_replies <= chat_begun);
+    }
     printf("%d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

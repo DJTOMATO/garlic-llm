@@ -54,6 +54,7 @@ The PS4 Pro and other firmware versions are not tested yet. If you try one, plea
 | L1 | Voice mode |
 | R1 | Run the Python program in the last answer |
 | R3 or touchpad | Think mode on / off |
+| L3 | [API](#api) on / off |
 | L2 / R2 | Temperature down / up |
 
 After dictating, choose what to do with the text: ✕ send, △ edit, □ record again, ○ discard.
@@ -91,19 +92,28 @@ The app is built with the open-source [OpenOrbis](https://github.com/OpenOrbis/O
 
 ## API
 
-While the console runs Garlic LLM, it serves an OpenAI-compatible API on port 8080 of your network. Point any OpenAI client at it:
+Garlic LLM can serve an OpenAI-compatible API on your network, so that your own programs and apps use the model on the console. It is off until you turn it on.
+
+> The API is new. It is in the source code and comes with the next package; version 1.19 does not have it yet.
+
+**Turn it on.** On the chat screen, press **L3** (click the left stick). The top of the screen then shows where the API listens, for example `API · 192.168.1.5:8080`. L3 again turns it off, and the app remembers the choice for the next time.
+
+**Use it.** Point any OpenAI client at that address, with `http://192.168.1.5:8080/v1` as its base URL:
 
 ```bash
-curl http://<console-address>:8080/v1/chat/completions \
+curl http://192.168.1.5:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":128}'
 ```
 
 - `GET /v1/models`, `POST /v1/chat/completions` (`stream: true` for server-sent events), `GET /health`.
 - The OpenAPI 3.1 description is at `GET /openapi.json` (also in [`chat/assets/openapi.json`](chat/assets/openapi.json)).
-- One request runs at a time, and the chat screen is busy while it does. The conversation on screen is replaced by the request's messages.
+- Replies are generated the way the chat generates its own, speculative decoding included.
+- One request runs at a time, and the chat screen is busy while it does: it says that a request is being answered, and ○ stops the reply (the client gets what was written so far, with `finish_reason: "length"`). Requests wait while the keyboard, voice mode or a Python program is open.
+- A request is a conversation of its own, so the one on the console's screen is cleared.
 - Reasoning is off. Only `n = 1` is supported; `tools`, `logprobs` and similar parameters are ignored.
-- For an API key, put it in `/data/garlic_api_key.txt` on the console. Requests then need `Authorization: Bearer <key>`. Without that file the API is open to anyone on your network.
+- For an API key, put it in `/data/garlic_api_key.txt` on the console. Requests then need `Authorization: Bearer <key>`. Without that file, anyone on your network can use the API while it is on, and clients that insist on a key accept any text.
+- If the screen shows `API · :8080`, the app could not read the console's address: it is in *Settings → Network → View Connection Status*.
 
 ## Build from source
 
