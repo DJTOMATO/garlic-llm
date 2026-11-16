@@ -26,11 +26,11 @@ Speeds were measured on a base/Slim PS4. In voice mode the chat model runs at ab
 
 ## Requirements
 
-- A PS4 running [GoldHEN](https://github.com/GoldHEN/GoldHEN). Tested on a base/Slim console with firmware 11.52.
+- A PS4 running [GoldHEN](https://github.com/GoldHEN/GoldHEN). Tested on a base/Slim console with firmware 11.52. Users also report it working on a PS4 Slim with firmware 14.00 and on a PS4 Pro with firmware 12.02 (25–45 tokens/s).
 - About 6 GB of free space, or 12 GB if you copy the package to the console's own disk before installing it.
 - To use your voice: any ordinary microphone the console recognises.
 
-The PS4 Pro and other firmware versions are not tested yet. If you try one, please [open an issue](https://github.com/leonardo-alegria/garlic-llm/issues) with the result.
+Other firmware versions are not tested yet. If you try one, please [open an issue](https://github.com/leonardo-alegria/garlic-llm/issues) with the result.
 
 ## Install
 
@@ -176,7 +176,7 @@ The scripts that made them from the original checkpoints are in `pc/`, and each 
 
 **Does it need internet?** No. The model, the voices and the speech recognition run on the console.
 
-**Does it run on a PS4 Pro?** Not tested yet.
+**Does it run on a PS4 Pro?** A user reports that version 1.19 works on a PS4 Pro with firmware 12.02, at 25 to 45 tokens/s. I have not tested it on a Pro myself.
 
 **And on a PS5?** No. Garlic LLM is written for the PS4's GPU and system software.
 
