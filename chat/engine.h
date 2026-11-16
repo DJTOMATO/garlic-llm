@@ -106,6 +106,7 @@ typedef struct {
 
 typedef struct {               // a voice: prompt speech tokens, prompt mel frames (2 per token), speaker vector
     char lang[4];               // "" = the built-in voice (assets/s3g_voice.bin), else assets/s3g_voice_<lang>.bin
+    char name[32];              // "default", "ru", or custom basename from /data/garlic-llm/voices/<name>.bin
     uint32_t np, nmel;
     int32_t* ptok;
     float* pmel;
@@ -119,7 +120,7 @@ typedef struct {
     uint32_t nt;
     char path[129];
     uint64_t size;
-    S3Voice voice[8];           // [0] the built-in voice, then the languages that have their own (Russian)
+    S3Voice voice[16];          // [0] built-in, language voices, then custom /data/garlic-llm/voices/*.bin
     int nvoice;
     uint32_t np, nmel;          // the voice in use (s3g_voice): prompt speech tokens, prompt mel frames, speaker vector
     int32_t* ptok;
@@ -268,6 +269,7 @@ int s3g_init(Engine* e, const char* assets_dir);
 // S3Gen's voice for a language ("ru", ...): its own if assets has one, else the built-in voice. Takes effect at the
 // next s3g_begin.
 void s3g_voice(Engine* e, const char* lang);
+int s3g_voice_named(Engine* e, const char* name);
 int s3g_load(Engine* e, uint64_t weights, uint64_t wsize, uint64_t scratch, uint64_t ssize);
 int s3g_begin(Engine* e, const uint16_t* tokens, int n, uint32_t seed);
 int s3g_step(Engine* e, float* out, int max);

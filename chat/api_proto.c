@@ -828,6 +828,53 @@ int api_chat_parse(const char* body, size_t len, JNode* pool, int max, ChatReque
 
 // ---- Qwen3.5 tool prompt and output parser ------------------------------------------------------------------------
 
+int api_speech_parse(const char* body, size_t len, JNode* pool, int max, SpeechRequest* req, const char** err) {
+    memset(req, 0, sizeof(*req));
+    sb_init(&req->input);
+    int root = json_parse(body, len, pool, max);
+    if (root < 0 || pool[root].type != J_OBJ) {
+        *err = "The body must be a JSON object.";
+        return -1;
+    }
+    int inp = json_get(pool, root, "input");
+    if (inp < 0 || pool[inp].type != J_STR || pool[inp].slen == 0) {
+        *err = "'input' must be a non-empty string.";
+        return -1;
+    }
+    json_str_sb(pool, inp, &req->input);
+    int vc = json_get(pool, root, "voice");
+    if (vc >= 0 && pool[vc].type == J_STR) {
+        Sb vs;
+        sb_init(&vs);
+        json_str_sb(pool, vc, &vs);
+        size_t k = vs.n < sizeof(req->voice) - 1 ? vs.n : sizeof(req->voice) - 1;
+        if (vs.p) memcpy(req->voice, vs.p, k);
+        req->voice[k] = 0;
+        sb_free(&vs);
+    }
+    int fmt = json_get(pool, root, "response_format");
+    if (fmt >= 0 && pool[fmt].type == J_STR) {
+        Sb fs;
+        sb_init(&fs);
+        json_str_sb(pool, fmt, &fs);
+        const char* fv = fs.p ? fs.p : "";
+        if (!strcmp(fv, "wav")) {
+            req->pcm = 0;
+        } else if (!strcmp(fv, "pcm") || !strcmp(fv, "pcm16")) {
+            req->pcm = 1;
+        } else {
+            sb_free(&fs);
+            sb_free(&req->input);
+            *err = "'response_format' must be 'wav' or 'pcm'.";
+            return -1;
+        }
+        sb_free(&fs);
+    }
+    return 0;
+}
+
+// ---- Qwen3.5 tool prompt and output parser ------------------------------------------------------------------------
+
 void api_system_tools(const JNode* pool, const ChatRequest* req, const char* user_sys, Sb* out) {
     sb_str(out, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
     if (req->tools >= 0) {

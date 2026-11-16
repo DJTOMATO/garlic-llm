@@ -128,6 +128,15 @@ typedef struct {
 // and content), or -1 with the reason in err (a fixed string, for the 400 answer).
 int api_chat_parse(const char* body, size_t len, JNode* pool, int max, ChatRequest* req, const char** err);
 
+typedef struct {
+    Sb input;
+    char voice[16];             // "auto", "en", "es", "pt", "ru", "it", "fr", "de"
+    int pcm;                    // 0 = wav, 1 = pcm
+} SpeechRequest;
+
+// Reads a /v1/audio/speech body ({"input": "...", "voice": "...", "response_format": "wav"|"pcm"}).
+int api_speech_parse(const char* body, size_t len, JNode* pool, int max, SpeechRequest* req, const char** err);
+
 // Builds the Qwen3.5 system prompt with tool declarations (plus user_sys if non-empty).
 void api_system_tools(const JNode* pool, const ChatRequest* req, const char* user_sys, Sb* out);
 // Formats an assistant message's tool_calls array into Qwen3.5 <tool_call><function=...> tags. Returns count, or -1.

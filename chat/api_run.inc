@@ -299,23 +299,40 @@ static int api_synthesize_audio(const ChatRequest* cr, const char* reply_text, s
     }
 
     const char* forced_lang = NULL;
+    const char* custom_voice = NULL;
+    char voice_buf[32];
+    snprintf(voice_buf, sizeof(voice_buf), "%s", cr->audio_voice);
+    char* colon = strchr(voice_buf, ':');
+    const char* lang_part = voice_buf;
+    if (colon) {
+        *colon = 0;
+        custom_voice = colon + 1;
+    }
     static const char* known_langs[] = {"es", "en", "pt", "ru", "it", "fr", "de"};
     for (size_t i = 0; i < sizeof(known_langs) / sizeof(known_langs[0]); i++) {
-        if (!strcmp(cr->audio_voice, known_langs[i])) {
+        if (!strcmp(lang_part, known_langs[i])) {
             forced_lang = known_langs[i];
             break;
         }
     }
+    if (!custom_voice && !forced_lang && voice_buf[0] && strcmp(voice_buf, "auto")) custom_voice = voice_buf;
     char base_lang[4];
     snprintf(base_lang, sizeof(base_lang), "%s", forced_lang ? forced_lang : st_lang(reply_text, lang_code()));
 
     Sb pcm;
     sb_init(&pcm);
     int cur = 0, len = (int)reply_len;
+    say("api audio: start len=%d voice=%s lang=%s", len, cr->audio_voice, base_lang);
     while (cur < len && !pcm.oom) {
-        if (api_chat_step(produced)) break;
+        if (api_chat_step(produced)) {
+            say("api audio: stopped by Circle");
+            break;
+        }
         int end = st_next_piece(reply_text, len, cur, 1);
-        if (end <= cur) break;
+        if (end <= cur) {
+            say("api audio: st_next_piece=%d <= cur=%d", end, cur);
+            break;
+        }
         while (end - cur < 80) {
             int e2 = st_next_piece(reply_text, len, end, 1);
             if (e2 <= end || st_spoken_len(reply_text + cur, e2 - cur) > 200) break;
@@ -328,29 +345,41 @@ static int api_synthesize_audio(const ChatRequest* cr, const char* reply_text, s
         cur = end;
         static char words[1024];
         int wl = st_clean(reply_text + start, end - start, words, sizeof(words) - 2);
-        if (!wl) continue;
+        if (!wl) {
+            say("api audio: st_clean=0");
+            continue;
+        }
         const char* lang = forced_lang ? forced_lang : st_lang(words, base_lang);
         wl = st_speak(words, wl, (int)sizeof(words) - 2, lang);
-        if (!wl) continue;
+        if (!wl) {
+            say("api audio: st_speak=0");
+            continue;
+        }
         for (char* c = words; *c; c++)
             if (*c == ':' && !(c > words && c[-1] >= '0' && c[-1] <= '9' && c[1] >= '0' && c[1] <= '9')) *c = ',';
 
         static uint16_t toks[512];
         int nt = ttstok_encode(&tts_tok, words, lang, toks, 400);
+        say("api audio: piece [%s] wl=%d nt=%d", lang, wl, nt);
         int max_out = (int)strlen(words) * 3 + 40;
         if (max_out > 450) max_out = 450;
         t3_voice(&eng, lang);
-        s3g_voice(&eng, lang);
-        if (t3_start(&eng, toks, nt, max_out, ++tts.seed, 0)) break;
-        int n_speech = 0;
+        if (!custom_voice || !s3g_voice_named(&eng, custom_voice)) s3g_voice(&eng, lang);
+        if (t3_start(&eng, toks, nt, max_out, ++tts.seed, 0)) {
+            say("api audio: t3_start failed (%s)", eng.error);
+            break;
+        }
+        int n_speech = 0, t_last = -1;
         for (;;) {
             int t = t3_next(&eng);
             if (t >= 0 && n_speech < 512) {
                 tts.speech[n_speech++] = (uint16_t)t;
                 continue;
             }
+            t_last = t;
             break;
         }
+        if (t_last == -2) say("api audio: t3_next failed (%s)", eng.error);
         static const uint16_t sil[6] = {6324, 6405, 4137, 4218, 6081, 6082};
         int run = 0;
         for (; run < n_speech; run++) {
@@ -360,10 +389,14 @@ static int api_synthesize_audio(const ChatRequest* cr, const char* reply_text, s
             if (!is) break;
         }
         if (run > 7) n_speech -= run - 7;
-        if (n_speech >= 2 && s3g_begin(&eng, tts.speech, n_speech, tts.seed) > 0) {
+        int s3r = n_speech >= 2 ? s3g_begin(&eng, tts.speech, n_speech, tts.seed) : 0;
+        if (s3r <= 0) say("api audio: s3g_begin=%d (n_speech=%d, %s)", s3r, n_speech, eng.error);
+        if (s3r > 0) {
             for (;;) {
                 int r = s3g_step(&eng, tts_pcm, (int)(sizeof(tts_pcm) / sizeof(tts_pcm[0])));
-                if (r <= 0) break;
+                if (r == -2) say("api audio: s3g_step failed (%s)", eng.error);
+                if (r < 0) break;
+                if (r == 0) continue;
                 float gain = eng.s3.gain;
                 for (int i = 0; i < r; i++) {
                     float v = tts_pcm[i] * gain;
@@ -394,7 +427,85 @@ static int api_synthesize_audio(const ChatRequest* cr, const char* reply_text, s
     return 0;
 }
 
+static void api_speech_job(ApiJob* job) {
+    JNode* pool = malloc(sizeof(JNode) * API_MAX_NODES);
+    SpeechRequest sr;
+    const char* err = NULL;
+    if (!pool || api_speech_parse(job->body, job->body_len, pool, API_MAX_NODES, &sr, &err)) {
+        if (pool) sb_free(&sr.input);
+        free(pool);
+        api_error(job->fd, "HTTP/1.1 400 Bad Request", err ? err : "Out of memory.", "invalid_request_error",
+                  "invalid_body");
+        return;
+    }
+    free(pool);
+    if (!tts_ready) {
+        sb_free(&sr.input);
+        api_error(job->fd, "HTTP/1.1 503 Service Unavailable", "TTS models are not loaded.", "server_error", NULL);
+        return;
+    }
+    api_chat_begin();
+    ChatRequest cr;
+    memset(&cr, 0, sizeof(cr));
+    cr.want_audio = 1;
+    cr.audio_pcm = sr.pcm;
+    snprintf(cr.audio_voice, sizeof(cr.audio_voice), "%s", sr.voice);
+    Sb audio_bin;
+    sb_init(&audio_bin);
+    if (api_synthesize_audio(&cr, sr.input.p, sr.input.n, 0, &audio_bin) == 0 && audio_bin.p && audio_bin.n > 0) {
+        Sb head;
+        sb_init(&head);
+        sb_str(&head, "HTTP/1.1 200 OK\r\nContent-Type: ");
+        sb_str(&head, sr.pcm ? "audio/pcm" : "audio/wav");
+        sb_str(&head, "\r\nContent-Length: ");
+        sb_int(&head, (long long)audio_bin.n);
+        sb_str(&head, "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        if (head.p && api_send(job->fd, head.p, head.n) == 0) api_send(job->fd, audio_bin.p, audio_bin.n);
+        sb_free(&head);
+    } else {
+        api_error(job->fd, "HTTP/1.1 500 Internal Server Error", eng.error[0] ? eng.error : "Speech synthesis failed.",
+                  "server_error", NULL);
+    }
+    sb_free(&audio_bin);
+    sb_free(&sr.input);
+    api_chat_end();
+#ifdef GARLIC_SPEC
+    if (!spec_lent) spec_lend();
+#endif
+}
+
+static void api_voices_job(ApiJob* job) {
+    Sb s, h;
+    sb_init(&s);
+    sb_init(&h);
+    sb_str(&s, "{\"voices\":[");
+    for (int i = 0; i < eng.s3.nvoice; i++) {
+        if (i) sb_add(&s, ",", 1);
+        sb_str(&s, "{\"id\":");
+        sb_json_str(&s, eng.s3.voice[i].name, strlen(eng.s3.voice[i].name));
+        sb_str(&s, ",\"type\":");
+        sb_json_str(&s, eng.s3.voice[i].lang[0] || !strcmp(eng.s3.voice[i].name, "default") ? "builtin" : "custom",
+                    eng.s3.voice[i].lang[0] || !strcmp(eng.s3.voice[i].name, "default") ? 7 : 6);
+        sb_add(&s, "}", 1);
+    }
+    sb_str(&s, "],\"languages\":[\"auto\",\"en\",\"es\",\"pt\",\"ru\",\"it\",\"fr\",\"de\"]}");
+    sb_str(&h, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+    sb_int(&h, (long long)s.n);
+    sb_str(&h, "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+    if (h.p && s.p && api_send(job->fd, h.p, h.n) == 0) api_send(job->fd, s.p, s.n);
+    sb_free(&h);
+    sb_free(&s);
+}
+
 static void api_job(ApiJob* job) {
+    if (job->kind == 2) {
+        api_voices_job(job);
+        return;
+    }
+    if (job->kind == 1) {
+        api_speech_job(job);
+        return;
+    }
     static unsigned api_count;
     JNode* pool = malloc(sizeof(JNode) * API_MAX_NODES);
     ChatRequest cr;

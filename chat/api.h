@@ -11,6 +11,7 @@
 
 typedef struct ApiJob {
     int fd;                     // the connection: the main thread writes the whole reply to it
+    int kind;                   // 0 = /v1/chat/completions, 1 = /v1/audio/speech
     char* body;                 // the request's JSON (validated by the server thread)
     size_t body_len;
     volatile int done;          // 1 once the main thread has written the reply

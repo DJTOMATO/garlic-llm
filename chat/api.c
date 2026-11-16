@@ -138,11 +138,23 @@ static int read_request(int fd, char** buf_out, size_t* len_out, HttpRequest* re
     return r == 0 ? 0 : -1;
 }
 
-static void serve_chat(int fd, HttpRequest* req) {
+static void serve_chat(int fd, HttpRequest* req, int kind) {
     JNode* pool = malloc(sizeof(JNode) * API_MAX_NODES);
     ChatRequest cr;
+    SpeechRequest sr;
     const char* err = NULL;
-    if (!pool || api_chat_parse(req->body, req->body_len, pool, API_MAX_NODES, &cr, &err)) {
+    int bad = !pool;
+    if (!bad) {
+        if (kind == 2) {
+            bad = 0;
+        } else if (kind == 1) {
+            bad = api_speech_parse(req->body, req->body_len, pool, API_MAX_NODES, &sr, &err);
+            sb_free(&sr.input);
+        } else {
+            bad = api_chat_parse(req->body, req->body_len, pool, API_MAX_NODES, &cr, &err);
+        }
+    }
+    if (bad) {
         say("api: 400 Bad Request (%s, %zu bytes)", err ? err : "Out of memory", req->body_len);
         free(pool);
         reply_json_error(fd, 400, "Bad Request", err ? err : "Out of memory.", "invalid_request_error", "invalid_body");
@@ -160,6 +172,7 @@ static void serve_chat(int fd, HttpRequest* req) {
     memcpy(body, req->body, req->body_len);
     body[req->body_len] = 0;
     job->fd = fd;
+    job->kind = kind;
     job->body = body;
     job->body_len = req->body_len;
     scePthreadMutexLock(&api_mu);
@@ -176,7 +189,7 @@ static void serve_chat(int fd, HttpRequest* req) {
                          "busy");
         return;
     }
-    say("api: chat request, %zu bytes, %s", req->body_len, cr.stream ? "streamed" : "whole reply");
+    say("api: %s request, %zu bytes", kind == 1 ? "speech" : "chat", req->body_len);
     // the main loop writes the reply to fd; the connection is closed here once it is written
     while (!job->done) sceKernelUsleep(5000);
     free(job->body);
@@ -222,9 +235,20 @@ static void handle(int fd) {
         free(spec);
     } else if (!strcmp(req.method, "POST") &&
                (!strcmp(req.path, "/v1/chat/completions") || !strcmp(req.path, "/chat/completions"))) {
-        serve_chat(fd, &req);
+        serve_chat(fd, &req, 0);
         free(buf);
         return;   // (serve_chat keeps the connection until the main loop has written the reply)
+    } else if (!strcmp(req.method, "POST") &&
+               (!strcmp(req.path, "/v1/audio/speech") || !strcmp(req.path, "/audio/speech"))) {
+        serve_chat(fd, &req, 1);
+        free(buf);
+        return;
+    } else if (!strcmp(req.method, "GET") &&
+               (!strcmp(req.path, "/v1/audio/voices") || !strcmp(req.path, "/audio/voices") ||
+                !strcmp(req.path, "/v1/audio/speech"))) {
+        serve_chat(fd, &req, 2);
+        free(buf);
+        return;
     } else {
         say("api: 404 %s %s", req.method, req.path);
         reply_json_error(fd, 404, "Not Found", "No such endpoint.", "invalid_request_error", NULL);
