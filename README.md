@@ -106,12 +106,13 @@ curl http://192.168.1.5:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":128}'
 ```
 
-- `GET /v1/models`, `POST /v1/chat/completions` (`stream: true` for server-sent events), `GET /health`.
+- `GET /v1/models`, `POST /v1/chat/completions` (`stream: true` for server-sent events), `POST /v1/audio/speech`, `GET /v1/audio/voices`, `GET /health`.
 - The OpenAPI 3.1 description is at `GET /openapi.json` (also in [`chat/assets/openapi.json`](chat/assets/openapi.json)).
 - Replies are generated the way the chat generates its own, speculative decoding included.
 - One request runs at a time, and the chat screen is busy while it does: it says that a request is being answered, and ○ stops the reply (the client gets what was written so far, with `finish_reason: "length"`). Requests wait while the keyboard, voice mode or a Python program is open.
 - A request is a conversation of its own, so the one on the console's screen is cleared.
 - Reasoning is off. Tool calling (`tools`, `tool_choice`, `tool_calls` and `role: "tool"` messages) and spoken audio replies (`"modalities": ["text", "audio"]` or `"audio": {"format": "wav", "voice": "auto"}`, returning base64 24 kHz WAV in `message.audio.data`) are supported; [`pc/web_search.py`](pc/web_search.py) is a keyless web search client (DuckDuckGo + Wikipedia) for the API. Only `n = 1` is supported.
+- Standalone TTS is available at `POST /v1/audio/speech` (returns 24 kHz `audio/wav` by default or raw PCM when `response_format` is `"pcm"`/`"pcm16"`). `GET /v1/audio/voices` lists built-in voices and any custom `PS3V` `.bin` voices placed in `/data/garlic-llm/voices/` on the console (created with [`pc/make_voice.py`](pc/make_voice.py)).
 - For an API key, put it in `/data/garlic_api_key.txt` on the console. Requests then need `Authorization: Bearer <key>`. Without that file, anyone on your network can use the API while it is on, and clients that insist on a key accept any text.
 - If the screen shows `API · :8080`, the app could not read the console's address: it is in *Settings → Network → View Connection Status*.
 
