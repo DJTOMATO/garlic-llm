@@ -858,16 +858,8 @@ int api_speech_parse(const char* body, size_t len, JNode* pool, int max, SpeechR
         sb_init(&fs);
         json_str_sb(pool, fmt, &fs);
         const char* fv = fs.p ? fs.p : "";
-        if (!strcmp(fv, "wav")) {
-            req->pcm = 0;
-        } else if (!strcmp(fv, "pcm") || !strcmp(fv, "pcm16")) {
-            req->pcm = 1;
-        } else {
-            sb_free(&fs);
-            sb_free(&req->input);
-            *err = "'response_format' must be 'wav' or 'pcm'.";
-            return -1;
-        }
+        if (!strcmp(fv, "pcm") || !strcmp(fv, "pcm16")) req->pcm = 1;
+        else req->pcm = 0;   // wav (and fallback for OpenAI clients like SillyTavern that request mp3/opus)
         sb_free(&fs);
     }
     return 0;
