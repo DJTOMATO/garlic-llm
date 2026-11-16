@@ -126,11 +126,13 @@ def read_webpage(url):
         return f"Failed to read {url}: {e}"
 
 
-def chat_completion(messages, want_audio=False, voice="auto"):
+def chat_completion(messages, want_audio=False, voice="auto", use_tools=True):
     headers = {"Content-Type": "application/json"}
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
-    payload = {"messages": messages, "tools": TOOLS, "temperature": 0.3, "max_tokens": 768}
+    payload = {"messages": messages, "temperature": 0.3, "max_tokens": 768}
+    if use_tools:
+        payload["tools"] = TOOLS
     if want_audio:
         payload["modalities"] = ["text", "audio"]
         payload["audio"] = {"format": "wav", "voice": voice}
@@ -145,7 +147,7 @@ def ask(question, messages=None, audio_file=None, voice="auto"):
         messages = []
     messages.append({"role": "user", "content": question})
     for _ in range(4):
-        res = chat_completion(messages, want_audio=bool(audio_file), voice=voice)
+        res = chat_completion(messages, want_audio=bool(audio_file), voice=voice, use_tools=True)
         msg = res["choices"][0]["message"]
         messages.append(msg)
         tool_calls = msg.get("tool_calls") or []
@@ -167,7 +169,7 @@ def ask(question, messages=None, audio_file=None, voice="auto"):
             else:
                 out = json.dumps({"error": f"Unknown tool: {fn}"})
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
-    res = chat_completion(messages, want_audio=bool(audio_file), voice=voice)
+    res = chat_completion(messages, want_audio=bool(audio_file), voice=voice, use_tools=False)
     msg = res["choices"][0]["message"]
     if audio_file and msg.get("audio", {}).get("data"):
         wav_bytes = base64.b64decode(msg["audio"]["data"])
